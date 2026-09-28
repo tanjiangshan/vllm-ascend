@@ -1,5 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# =============================================================================
+# GLM-5.Next 的注意力模块（MLA 多头潜在注意力 + KPool 稀疏索引器）。
+#
+# 核心内容：
+#   1. Indexer           —— KPool 稀疏注意力索引器：为每个 token 从历史中选出
+#                           top-k 个"关键"上下文 token（以 k 池为粒度压缩存储），
+#                           供稀疏 MLA（DSA，DeepSeek 风格稀疏注意力）只对被选
+#                           token 做完整注意力计算。
+#   2. Glm5NextMLAAttention —— 完整的 MLA 注意力层：借鉴 DeepSeek-V2/V3 的
+#                           低秩 KV 压缩（kv_lora_rank）+ 解耦 RoPE 分量，
+#                           并把上游 vLLM 的 MultiHeadLatentAttentionWrapper
+#                           组合进来，实现"索引器选 token + MLA 注意力"的融合。
+#
+# NPU 适配点：
+#   - 索引器的前向计算不在 Python 端实现，而是委托给
+#     vllm_ascend.attention.indexer_kpool 中的 Ascend 后端（自定义算子）。
+#   - k_cache / tail_cache 分别用 Glm5NextIndexerCache / Glm5NextTailCache
+#     注册到 vLLM 的静态前向上下文，由模型运行时统一分配 NPU 显存。
+# =============================================================================
 
 import torch
 from torch import nn
@@ -37,6 +56,22 @@ from vllm_ascend.models.glm5next.kv_cache import (
 
 
 class Indexer(nn.Module):
+    """KPool 稀疏注意力索引器（GLM-5.Next v32 配置专用）。
+
+    作用：在 MLA 注意力之前，用一个轻量的"索引头"对历史 KV 做相关性打分，
+    选出 top-k 个候选 token 位置，输出到共享的 topk_indices_buffer，
+    供后续稀疏注意力算子（SFA，Sparse Flash Attention）只计算被选中的键值对。
+
+    原理（KPool 压缩）：
+    - 每 ``index_kpool``（默认 4）个连续 token 的索引 K 向量被"池化"为 1 个
+      存储条目（带可学习的 APE 绝对位置编码 + gate 门控），因此缓存体积缩小
+      kpool 倍；未凑满一池的"尾巴" token 存放在 per-request 的 TailCache 环中。
+    - topk 以"池"为粒度执行（select_k = index_topk // index_kpool）。
+
+    注意：本类的 forward() 刻意抛异常——实际计算走 IndexerWrapper 的
+    Ascend 后端（自定义 NPU 算子），本类只承载权重与缓存注册。
+    """
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -48,6 +83,19 @@ class Indexer(nn.Module):
         topk_indices_buffer: torch.Tensor | None,
         prefix: str = "",
     ):
+        """初始化索引器。
+
+        参数：
+            vllm_config: vLLM 全局配置。
+            config: GLM-5.Next 模型配置。
+            hidden_size: 模型隐藏维度（如 4096）。
+            q_lora_rank: MLA 的 Q 低秩维度（如 1536），索引器 Q 从它投影。
+            quant_config: 量化配置（FP8 等），可为 None。
+            cache_config: KV cache 配置（含 block_size）。
+            topk_indices_buffer: 共享的 top-k 结果缓冲区，
+                形状 [max_num_batched_tokens, buffer_width]，int32。
+            prefix: 层名前缀（用于权重命名与静态上下文注册）。
+        """
         super().__init__()
         self.vllm_config = vllm_config
         self.config = config
@@ -70,6 +118,13 @@ class Indexer(nn.Module):
         self.q_lora_rank = q_lora_rank  # 1536
 
         # kpool
+        # 步骤1: KPool 压缩的可学习参数。
+        # compress_ape 形状 [kpool, head_dim]，FP32：绝对位置编码（APE），
+        #   池内第 j 个 token 的 K 会被加上 ape[j] 再做门控加权，保留池内顺序信息。
+        # compress_gate 形状 [head_dim, hidden_size]，BF16：门控投影，
+        #   由 hidden_states 生成与各池内条目做内积的"查询式"门控分数。
+        # 注意：参数名刻意不带 ".weight" 后缀以匹配 checkpoint 命名，
+        # torch.mm 直接消费其 [head_dim, hidden_size] 形状。
         self.index_kpool_compress_ape = nn.Parameter(torch.zeros(self.index_kpool, self.head_dim, dtype=torch.float32))
         # Keep the checkpoint name ``index_kpool_compress_gate`` without a
         # ``.weight`` suffix. torch.mm consumes its [head_dim, hidden_size] shape.
@@ -99,6 +154,9 @@ class Indexer(nn.Module):
         self.quant_block_size = self.head_dim
         self.topk_indices_buffer = topk_indices_buffer
         # Completed pools store BF16 vectors without quantization scales.
+        # 步骤2: 注册两类缓存层。
+        # k_cache：已"池化完成"的压缩 K 缓存（BF16，无量化 scale），
+        # 以 AscendMLAAttentionSpec 描述，tokens_per_state=kpool 表示压缩比。
         self.k_cache = Glm5NextIndexerCache(
             head_dim=self.head_dim,
             dtype=torch.bfloat16,
@@ -108,6 +166,8 @@ class Indexer(nn.Module):
             compress_ratio=self.index_kpool,
         )
         # Request-owned FP32 K/gate ring retains the incomplete pool.
+        # tail_cache：请求私有的 FP32 环形缓存，保存"未凑满一池"的原始 K
+        # 与门控分数；环容量 = kpool + 投机解码 lookahead（见 kv_cache.py）。
         self.tail_cache = Glm5NextTailCache(
             head_dim=self.head_dim,
             dtype=torch.float32,
@@ -118,6 +178,11 @@ class Indexer(nn.Module):
         self.prefix = prefix
 
     def get_ascend_indexer_backend_cls(self):
+        """返回 Ascend 侧索引器后端类（Glm5NextKPoolIndexerBackend）。
+
+        延迟导入（lazy import）使本模型模块在进程启动阶段不依赖共享
+        算子注册表，避免循环导入并缩短导入时间。
+        """
         # Lazy import keeps the model module independent from the shared ops
         # registry during process startup.
         from vllm_ascend.attention.indexer_kpool import (
@@ -133,11 +198,38 @@ class Indexer(nn.Module):
         positions,
         rotary_emb,
     ) -> torch.Tensor:
+        """占位 forward：实际稀疏索引计算由 Ascend 后端执行。
+
+        参数（仅作接口示意）：
+            hidden_states: [num_tokens, hidden_size] 隐藏状态。
+            qr: RoPE 后的索引查询。
+            positions: [num_tokens] token 位置。
+            rotary_emb: 旋转位置编码模块。
+
+        原理：真正的计算路径是 IndexerWrapper 在其 Ascend 后端中调用
+        SparseAttnIndexerKpool（见 sparse_attn_indexer_kpool.py）完成
+        "tail 压缩写缓存 + top-k 选择"，因此这里直接抛错以防误用。
+        """
         del hidden_states, qr, positions, rotary_emb
         raise RuntimeError("GLM-Next Indexer must run through IndexerWrapper's Ascend backend.")
 
 
 class Glm5NextMLAAttention(nn.Module):
+    """GLM-5.Next 的 MLA（Multi-head Latent Attention，多头潜在注意力）层。
+
+    结构（DeepSeek-V2/V3 风格 + GLM-5.Next 定制）：
+    - KV 低秩压缩：kv_a_proj 把 hidden 压到 kv_lora_rank 维的"潜在 KV"，
+      推理时 cache 只存压缩向量（+RoPE 分量），大幅节省 KV cache 显存。
+    - Q 侧可选低秩（q_lora_rank）：q_a_proj -> q_a_layernorm -> q_b_proj。
+    - qk_nope_head_dim 与 qk_rope_head_dim 分离：RoPE 只作用于 rope 分量，
+      保证压缩后的 KV 仍能施加位置相关的注意力。
+    - mla_nope（skip_rope）配置：GLM 部分层完全不加 RoPE。
+    - v32 配置额外挂载 Indexer（KPool 稀疏索引器）实现稀疏注意力。
+
+    实现方式：本类只负责"组装权重 + 配置"，前向委托给上游 vLLM 的
+    MultiHeadLatentAttentionWrapper（其中融合了稀疏索引器调度）。
+    """
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -157,6 +249,27 @@ class Glm5NextMLAAttention(nn.Module):
         input_size: int | None = None,
         skip_rope: bool | None = False,
     ) -> None:
+        """初始化 MLA 注意力层。
+
+        参数：
+            vllm_config: vLLM 全局配置。
+            config: Glm5NextConfig 模型配置。
+            hidden_size: 隐藏维度 H。
+            num_heads: 注意力头总数（跨 TP 切分）。
+            qk_nope_head_dim: 每头非 RoPE 维度（潜在 KV 解压出的部分）。
+            qk_rope_head_dim: 每头 RoPE 维度。
+            v_head_dim: 每头 V 维度。
+            q_lora_rank: Q 低秩秩数；None 表示不做 Q 低秩压缩。
+            kv_lora_rank: KV 低秩秩数（压缩后的潜在 KV 维度）。
+            max_position_embeddings: 最大位置数（RoPE 用）。
+            cache_config: KV cache 配置。
+            quant_config: 量化配置。
+            prefix: 层名前缀。
+            topk_indices_buffer: 稀疏索引共享缓冲区（v32 配置必需）。
+            input_size: 投影输入维度；None 时取 hidden_size
+                （Eagle3 + MLA 草稿模型会传入不同的输入维度）。
+            skip_rope: 是否完全跳过 RoPE（GLM mla_nope 配置）。
+        """
         super().__init__()
         self.hidden_size = hidden_size
         self.qk_nope_head_dim = qk_nope_head_dim
@@ -177,8 +290,13 @@ class Glm5NextMLAAttention(nn.Module):
 
         # Use input_size for projection input dimensions if provided,
         # otherwise default to hidden_size (used in Eagle3 Deepseek with MLA)
+        # 步骤1: 确定投影输入维度。普通层 = hidden_size；
+        # MTP/Eagle3 草稿层可能拼接了上一层的隐状态，输入维度不同。
         proj_input_size = input_size if input_size is not None else self.hidden_size
 
+        # 步骤2: 构建 a 侧投影（低秩压缩入口）。
+        # 有 Q 低秩时融合 q_a_proj + kv_a_proj 为单个 GEMM（省一次矩阵乘）；
+        # 无 Q 低秩时仅做 kv_a_proj_with_mqa（MQA 式共享 KV）。
         if self.q_lora_rank is not None:
             self.fused_qkv_a_proj = DeepSeekV2FusedQkvAProjLinear(
                 proj_input_size,
@@ -195,6 +313,8 @@ class Glm5NextMLAAttention(nn.Module):
                 prefix=f"{prefix}.kv_a_proj_with_mqa",
             )
 
+        # 步骤3: Q 侧投影。q_lora_rank 非空：q_a_layernorm + q_b_proj（低秩两段式）；
+        # 否则直接 q_proj 一步到全部头。ColumnParallelLinear 按注意力头做 TP 切分。
         if self.q_lora_rank is not None:
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
@@ -212,6 +332,10 @@ class Glm5NextMLAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
             )
+        # 步骤4: KV 解压投影与输出投影。
+        # kv_a_layernorm 归一化压缩的潜在 KV；kv_b_proj 把潜在 KV 解压为
+        # 各头的 nope-K 与 V。FP8 checkpoint 中 kv_b_proj 保持 BF16（无量化 scale），
+        # 因此 quant_config=None。
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -228,6 +352,10 @@ class Glm5NextMLAAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
+        # 步骤5: RoPE 旋转位置编码。
+        # 非 skip_rope 时根据 rope_parameters 构建编码器；Yarn 类型会把
+        # rope_type 改写为 deepseek_yarn / deepseek_llama_scaling，
+        # 并按 yarn_get_mscale 调整注意力缩放因子（长外推补偿）。
         if not skip_rope:
             assert config.rope_parameters is not None
             if config.rope_parameters["rope_type"] != "default":
@@ -255,9 +383,13 @@ class Glm5NextMLAAttention(nn.Module):
         else:
             self.rotary_emb = None
 
+        # 步骤6: v32 配置判定——index_topk 非空即为稀疏（v32）配置，
+        # 需要构建索引器 RoPE 与 Indexer 实例；否则为纯稠密 MLA。
         self.is_v32 = config.index_topk is not None
 
         if self.is_v32:
+            # 索引器有独立的 RoPE；其排列方式由 indexer_rope_interleave 决定
+            # （是否交替取维度，对应 is_neox_style 取反）。
             self.indexer_rope_emb: RotaryEmbedding | None = get_rope(
                 qk_rope_head_dim,
                 max_position=max_position_embeddings,
@@ -282,6 +414,9 @@ class Glm5NextMLAAttention(nn.Module):
             self.indexer_rope_emb = None
             self.indexer = None
 
+        # 步骤7: 把上述子模块打包成 MLAModules（上游 vLLM 的可插拔 MLA
+        # 组件容器），再交给 MultiHeadLatentAttentionWrapper 统一执行前向。
+        # 语法点：条件表达式 `x if cond else None` 按是否有 Q 低秩二选一填充。
         mla_modules = MLAModules(
             kv_a_layernorm=self.kv_a_layernorm,
             kv_b_proj=self.kv_b_proj,
@@ -318,10 +453,27 @@ class Glm5NextMLAAttention(nn.Module):
         # the static forward context. Publish GLM-Next's cache contract on that
         # layer, matching the dedicated cache layer used by the source branch,
         # so the model runner can remain model agnostic.
+        # 步骤8: 在 MLA wrapper 持有的 AttentionLayerBase 上发布 GLM-Next 的
+        # 缓存契约标记：model_version="glm5_next" 让 cache_config.py /
+        # cache_views.py 能识别该层；indexes_kv_by_block_stride=True 表示
+        # 该层的 KV 槽位映射按"块步长"重排（KPool 压缩后的索引规则）。
+        # 这样模型运行时（model runner）可以保持模型无关。
         mla_cache_layer = self.mla_attn.mla_attn
         mla_cache_layer.model_version = "glm5_next"
         mla_cache_layer.indexes_kv_by_block_stride = True
 
     def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """MLA 前向：委托给 MultiHeadLatentAttentionWrapper。
+
+        参数：
+            hidden_states: [num_tokens, hidden_size] 输入隐藏状态。
+            positions: [num_tokens] 每个 token 的位置（RoPE 用）。
+
+        返回：
+            [num_tokens, hidden_size] 注意力输出。
+
+        说明：wrapper 内部会先运行稀疏索引器（v32 配置）选出 top-k 上下文，
+        再执行 MLA 注意力与 KV cache 读写（含 NPU 自定义算子）。
+        """
         # The wrapper also runs the sparse indexer before MLA attention.
         return self.mla_attn(positions, hidden_states)

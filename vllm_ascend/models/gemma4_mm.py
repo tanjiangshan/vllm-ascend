@@ -13,6 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 中文补充说明（原英文 docstring 保留于下一行）:
+# 本模块实现 Gemma4 多模态模型在昇腾 NPU 上的适配，核心内容：
+# 1) AscendGemma4ForConditionalGeneration——继承上游 vLLM 的
+#    Gemma4ForConditionalGeneration，为视觉塔/音频塔注入昇腾 ModelSlim
+#    量化配置（MXFP4/MXFP8 动态量化），并处理视觉 patch 嵌入器的激活
+#    dtype 兼容问题；
+# 2) 多模态架构: 视觉塔（图/视频）+ 可选音频塔 + 多模态嵌入器
+#    （Gemma4MultimodalEmbedder，把模态特征投影到文本隐空间）+ Gemma4
+#    文本语言模型（含 MoE 层）；
+# 3) NPU 适配点: 上游视觉 patch 嵌入器会把 pixel_values 转成投影权重的
+#    dtype；而昇腾 MXFP4/MXFP8 量化权重的存储 dtype 是打包后的整型，
+#    并非逻辑激活 dtype，因此需要 monkey-patch 嵌入器 forward，把激活
+#    保持在 model_dtype，量化线性层内部再自行做激活量化。
 """Ascend-specific Gemma4 multimodal model adaptations."""
 
 import torch
