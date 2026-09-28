@@ -6,10 +6,28 @@ Migrated from reference/vllm_cp/vllm/models/minimax_m3/common/ops/sparse_attn.py
 The Python wrappers adapt vLLM Ascend's KV cache layout to the paged layout
 expected by the migrated kernels.
 """
+"""（MiniMax M3 块稀疏注意力的 Triton kernel —— Atlas A5 优化版。）
+
+【与通用版 msa_m3_triton.py 的差异】
+1. 打分与选块流程重组：decode 打分（_decode_qk_score_kernel）+
+   topk 后处理（_index_topk_postprocess_kernel）分离为小核组合，
+   每核更小 → A5 上编译更快、启动延迟更低；
+2. 掩码预计算：_decode_index_score_masks_kernel 把"初始块/局部块
+   保底掩码"作为独立核预生成（通用版在 topk 核内联处理）；
+3. launch 配置自适应：_decode_qk_score_target_programs 按 AI Core 数
+   定 grid；_prune_decode_index_score_configs 对 autotune 配置剪枝
+  （num_reqs 大时限制 chunk 数，防 grid 爆炸）；
+4. 主 KV cache 布局：A5 上 K/V 拼接成 [num_blocks, 2, 128, heads, dim]
+   （通用版保持分体布局，由 kernel 直接适配两种）。
+
+其余算法（块稀疏 GQA、top-k 合并、prefill 变长处理）与通用版一致。
+"""
 
 # TODO: Unify the A3 and A5 sparse-attention kernels once their operator
 # interfaces and implementations are compatible. They must remain separate
 # for now.
+# （TODO：待算子接口与实现兼容后统一 A3 与 A5 的稀疏注意力 kernel，
+#   目前必须保持分离。）
 
 from __future__ import annotations
 
@@ -36,9 +54,12 @@ except ImportError:
     init_device_properties_triton = None
 
 # One sparse block == one KV page.
+# （一个稀疏块 = 一个 KV 页：块大小与页大小一致，索引即页号。）
 SPARSE_BLOCK_SIZE = 128
 
 
+# 主 KV cache 布局适配：把 (K, V) 分体或 [2, ...] 前缀布局统一转成
+# Triton kernel 期望的 [num_blocks, 2, block, heads, dim]（permute 是零拷贝视图）。
 def _as_triton_main_kv_cache(
     kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
 ) -> torch.Tensor:
@@ -70,6 +91,8 @@ def _as_triton_index_kv_cache(
     return index_kv_cache
 
 
+# PDL（Program Dependent Launch）支持探测：按架构判定能否用
+# 依赖启动（前序核未结束时提前发射后续核，减小间隙）。
 def _is_arch_support_pdl() -> bool:
     if current_platform.device_name == "npu":
         return False
@@ -107,6 +130,8 @@ _DECODE_QK_SCORE_MAX_CHUNKS = 256
 
 
 @lru_cache(maxsize=1)
+# decode 打分核的目标 program 数：优先取设备 AI Core 数
+#（探测失败用下限兜底），保证计算核铺满硬件。
 def _decode_qk_score_target_programs() -> int:
     if get_aicore_num is None or init_device_properties_triton is None:
         return _DECODE_QK_SCORE_MIN_PROGRAMS
@@ -129,6 +154,8 @@ _DECODE_INDEX_SCORE_AUTOTUNE_CONFIGS = [
 ]
 
 
+# autotune 配置剪枝钩子：num_reqs 大时限制每请求的 chunk 数，
+# 防止 grid 总量超过上限（grid 爆炸会拖慢调度）。
 def _prune_decode_index_score_configs(configs, nargs, **kwargs):
     num_reqs = max(1, nargs["num_reqs"])
     max_chunks = max(1, _DECODE_INDEX_SCORE_MAX_GRID // num_reqs)
@@ -137,6 +164,8 @@ def _prune_decode_index_score_configs(configs, nargs, **kwargs):
     return pruned or configs[:1]
 
 
+# ---- 块级打分核（prefill 与通用路径共用）----
+# 对每个 query 与每个历史 block 计算 index_q · block(index_k) 的聚合分数。
 @triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
 def _index_block_score_kernel(
     q_ptr,
@@ -248,6 +277,9 @@ def _index_block_score_kernel(
 # constants so the grid is fixed within a cuda graph. The score scale is omitted
 # because decode only consumes block ordering.
 # ---------------------------------------------------------------------------
+# ---- decode QK 打分核（A5 低延迟路径）----
+# 小核设计：只做 q·k 分数，topk 选择交给后处理核，
+# 两核接力比一体核在 A5 上延迟更低。
 @triton.jit(do_not_specialize=["decode_query_len"])
 def _decode_qk_score_kernel(
     q_ptr,
@@ -371,6 +403,9 @@ def _decode_qk_score_kernel(
 # Forced init/local blocks are already encoded in the scores.
 # ---------------------------------------------------------------------------
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
+# ---- decode top-k 后处理核 ----
+# 输入打分核的 raw top-k（int64），施加保底/掩码修正后
+# 输出最终 [num_idx_heads, total_q, topk] int32 索引。
 @triton.jit(do_not_specialize=["decode_query_len"])
 def _index_topk_postprocess_kernel(
     ti_in_ptr,  # [num_idx_heads, total_q, topk] int64 input
@@ -418,6 +453,8 @@ def _index_topk_postprocess_kernel(
 # ---------------------------------------------------------------------------
 # Prefill top-k: prepare scores (pad tail, force init/local), then torch.topk.
 # ---------------------------------------------------------------------------
+# ---- prefill 打分结果预处理核（Vector/AIV 负载）----
+# 把"每请求连续 block 分数段"整理为 topk 候选布局（分 chunk 处理）。
 @triton.jit(do_not_specialize=["max_block", "chunk_blocks", "num_prep_chunks"])
 def _prefill_index_score_prepare_for_topk_kernel(
     score_ptr,  # [num_idx_heads, total_q, score_block_stride] fp32 in/out
@@ -466,6 +503,8 @@ def _prefill_index_score_prepare_for_topk_kernel(
 
 
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
+# ---- prefill top-k 无效索引掩码核 ----
+# 剔除越界/因果违规的候选块索引。
 @triton.jit(do_not_specialize_on_alignment=["prefix_lens"])
 def _topk_index_mask_invalid_prefill_kernel(
     ti_ptr,  # [num_idx_heads, total_q, topk] int32 in/out
@@ -503,6 +542,8 @@ def _topk_index_mask_invalid_prefill_kernel(
 # Decode init/local bool masks for index scoring. fp32 intermediates; split-K
 # over max_block with shape-constant chunk count (cudagraph-safe).
 # ---------------------------------------------------------------------------
+# ---- decode 保底掩码核 ----
+# 预生成"初始块 + 局部块"的布尔掩码（供打分/后处理核强制保留）。
 @triton.jit(do_not_specialize=["decode_query_len", "max_block", "chunk_blocks"])
 def _decode_index_score_masks_kernel(
     init_mask_ptr,  # [total_q, score_block_stride] bool out
@@ -559,6 +600,7 @@ def _decode_index_score_masks_kernel(
 # Python wrappers
 # ---------------------------------------------------------------------------
 @torch.no_grad()
+# 构建整步 decode 掩码（Python 侧：分块策略 + 调用上面的掩码核）。
 def _build_decode_index_score_masks(
     seq_lens: torch.Tensor,
     decode_query_len: int,
@@ -601,6 +643,7 @@ def _build_decode_index_score_masks(
 
 
 @torch.no_grad()
+# 【公共入口】prefill 索引打分（A5 版）。
 def minimax_m3_index_score(
     idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
     index_kv_cache: torch.Tensor,  # [num_blocks, 128, head_dim]
@@ -661,6 +704,7 @@ def minimax_m3_index_score(
 
 
 @torch.no_grad()
+# 【公共入口】prefill top-k 选块（A5 版）。
 def minimax_m3_index_topk(
     score: torch.Tensor,  # [num_idx_heads, total_q, max_block]
     cu_seqlens_q: torch.Tensor,  # [batch+1] int32
@@ -729,6 +773,7 @@ def minimax_m3_index_topk(
 
 
 @torch.no_grad()
+# 【公共入口】decode 打分 + top-k（A5 低延迟组合：打分核 → 后处理核）。
 def minimax_m3_index_decode(
     idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
     index_kv_cache: torch.Tensor,  # [num_blocks, 128, head_dim]
@@ -859,6 +904,8 @@ def minimax_m3_index_decode(
         "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"] * triton.next_power_of_2(args["gqa_group_size"]),
     }
 )
+# ---- prefill 块稀疏 GQA 注意力核 ----
+# 只遍历 top-k 索引指向的 KV block，块内缩放点积 + 在线 softmax。
 @triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
 def _gqa_sparse_fwd_kernel(
     q_ptr,  # [total_q, num_heads, head_dim]
@@ -1014,6 +1061,8 @@ def _gqa_sparse_fwd_kernel(
         "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
     }
 )
+# ---- decode 块稀疏 GQA 注意力核 ----
+# gather top-k 块 KV 精确计算；decode_query_len>1 支持投机验证。
 @triton.jit(do_not_specialize=["decode_query_len"])
 def _gqa_sparse_decode_kernel(
     q_ptr,  # [total_q, num_heads, head_dim]
@@ -1173,6 +1222,8 @@ def _gqa_sparse_decode_kernel(
 
 
 @triton.heuristics({"BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"])})
+# ---- top-k 分块输出合并核 ----
+# 块数超单 program 上限时合并各部分输出的加权结果。
 @triton.jit
 def _merge_topk_attn_out_kernel(
     o_ptr,  # partials: [NUM_TOPK_CHUNKS, total_q, num_heads, head_dim]
@@ -1225,6 +1276,7 @@ def _merge_topk_attn_out_kernel(
 # Python wrappers
 # ---------------------------------------------------------------------------
 @torch.no_grad()
+# 【公共入口】prefill 块稀疏注意力（A5 版）。
 def minimax_m3_sparse_attn(
     q: torch.Tensor,  # [total_q, num_heads, head_dim]
     kv_cache: torch.Tensor,  # [num_blocks, 2, 128, num_kv_heads, head_dim]
@@ -1285,6 +1337,7 @@ def minimax_m3_sparse_attn(
 
 
 @torch.no_grad()
+# 【公共入口】decode 块稀疏注意力（A5 版）。
 def minimax_m3_sparse_attn_decode(
     q: torch.Tensor,  # [total_q, num_heads, head_dim]
     kv_cache: torch.Tensor,  # [num_blocks, 2, 128, num_kv_heads, head_dim]

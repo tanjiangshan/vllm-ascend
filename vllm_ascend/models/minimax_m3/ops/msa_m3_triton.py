@@ -7,6 +7,33 @@ and sparse_attn.py. The kernels accept K/V cache tensors directly so Ascend's
 split cache layout does not need to be materialized into the GPU
 ``[num_blocks, 2, ...]`` layout.
 """
+"""（MiniMax M3 块稀疏 GQA 注意力的 Triton kernel —— 昇腾 Triton-Ascend 版。）
+
+【文件定位】从参考实现迁移的通用版 kernel；A5 专用优化版见
+msa_m3_triton_a5.py（两者接口兼容但暂不合并）。
+kernel 直接消费昇腾的分体式 K/V cache 布局，无需物化成 GPU 的
+[num_blocks, 2, ...] 拼接布局（省一次大拷贝）。
+
+【Triton 语法速览】
+- @triton.jit：把 Python 函数编译成 GPU/NPU kernel；
+- tl.program_id(axis)：当前 program 在 grid 某轴的编号（类比 CUDA blockIdx）；
+- tl.arange(0, BLOCK)：生成本 program 内的线程/元素偏移；
+- tl.load/store(指针 + 偏移, mask=..., other=...)：带掩码的内存读写；
+- do_not_specialize=[...]：声明这些标量参数不参与特化
+ （不同取值共享同一份编译产物，避免重编译抖动）。
+
+【模块内 kernel 一览】
+1. _prefill_index_score_kernel：prefill 索引打分（query 分块 × block 扫描）；
+2. _decode_index_score_kernel：decode 索引打分（block_offset 支持 TP 分片）；
+3. _mask_decode_topk_indices_kernel / _mask_prefill_topk_indices_kernel：
+   top-k 结果掩码（初始块/局部块保底 + 越界剔除）；
+4. _prepare_prefill_topk_scores_kernel：prefill 打分结果的 topk 预处理；
+5. _gqa_sparse_fwd_kernel：prefill 块稀疏 GQA 注意力；
+6. _gqa_sparse_decode_kernel：decode 块稀疏 GQA 注意力；
+7. _merge_topk_attn_out_kernel：topk 分块的部分输出加权合并。
+公共入口：minimax_m3_index_score / _topk / _decode /
+minimax_m3_sparse_attn / minimax_m3_sparse_attn_decode。
+"""
 
 from __future__ import annotations
 
@@ -19,6 +46,8 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
 
+# 条件导入：昇腾 Triton 工具（AI Core 数量探测等）；
+# try/except/else 模式保证无该模块时优雅降级（导入失败置 None）。
 get_aicore_num: Callable[[], Any] | None
 init_device_properties_triton: Callable[[], Any] | None
 try:
@@ -46,22 +75,27 @@ else:
     get_vectorcore_num = _get_vectorcore_num
 
 # Data-layout constants.
+# （数据布局常量：稀疏块 = 128 token；分数缓冲对齐到 16。）
 SPARSE_BLOCK_SIZE = 128
 SCORE_BLOCK_STRIDE_ALIGNMENT = 16
 
 # Index-score kernel configuration.
+# （索引打分核配置：prefill 打分的 query 分块大小。）
 PREFILL_SCORE_QUERY_TILE_SIZE = 96
 
 # Decode score launch policy. The detected device AIC count is used whenever
 # available; 32 is only a fallback when device-property discovery is unavailable.
+# （decode 打分启动策略：优先用探测到的 AI Core 数，32 只是探测失败时的兜底。）
 DECODE_SCORE_FALLBACK_PROGRAM_COUNT = 32
 DECODE_SCORE_MAX_CHUNK_COUNT = 256
 
 # Prefill prepare is a Vector/AIV workload. Keep the logical grid close to the
 # detected Vector Core count; each program processes a contiguous query range
 # for one (batch, head) group and only writes contiguous block segments.
+# （prefill 预处理是 Vector/AIV 负载：逻辑 grid 贴近 Vector Core 数。）
 PREFILL_PREPARE_FALLBACK_VECTORCORE_COUNT = 64
 
+# FP8 数据类型集合（打分核的反量化分支判定用）。
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
@@ -181,6 +215,11 @@ def _detected_vectorcore_count() -> int:
 # each K-tile is exactly one page (one K tile == one sparse block).
 # ---------------------------------------------------------------------------
 # Scalar metadata loads do not require pointer-alignment specialization.
+# ---- prefill 索引打分核 ----
+# 网格映射：program 对应 (query 块, index 头, 请求) 组合。
+# 算法：逐 query 分块与逐 KV block 计算 index_q · index_k 的块级聚合分数，
+# 写入 score 缓冲（对齐到 SCORE_BLOCK_STRIDE）。
+# FP8 cache 时在核内反量化（乘 scale）后累加。
 @triton.jit(
     do_not_specialize_on_alignment=[
         "sequence_lengths_ptr",
@@ -353,6 +392,10 @@ def _prefill_index_score_kernel(
 # runtime query length used to map each query token back to its request metadata.
 # The score scale is omitted because decode only consumes block ordering.
 # ---------------------------------------------------------------------------
+# ---- decode 索引打分核 ----
+# block_offset 支持 TP 分片调用（每 rank 只扫自己区间的块，
+# 分数/索引用 all_gather 归并，见 msa_m3.py::_decode_topk_tp_sharded）。
+# decode 时每个请求通常只有 1 个（或投机解码的 k 个）query。
 @triton.jit(do_not_specialize=["decode_query_len", "block_offset"])
 def _decode_index_score_kernel(
     q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
@@ -511,6 +554,9 @@ def _decode_index_score_kernel(
 # Forced init/local blocks are already encoded in the scores.
 # ---------------------------------------------------------------------------
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
+# ---- decode top-k 索引修正核 ----
+# 打分核给出的 raw top-k 需要修正：强制保留初始块/局部块（保底），
+# 剔除越界/重复块，输出最终 [num_idx_heads, total_q, topk] 索引。
 @triton.jit(do_not_specialize=["decode_query_len", "block_offset"])
 def _mask_decode_topk_indices_kernel(
     ti_ptr,  # [num_idx_heads, total_q, topk] int32 in/out
@@ -561,6 +607,10 @@ def _mask_decode_topk_indices_kernel(
 # regular vector addresses. The invalid tail is also written with a common
 # column vector and a row mask; no per-query dynamic scatter is used.
 # ---------------------------------------------------------------------------
+# ---- prefill top-k 预处理核（Vector/AIV 负载）----
+# 把打分核产出的"每请求连续 block 分数段"整理成 topk 候选布局，
+# 供后续掩码核生成最终索引。每个 program 处理一个 (batch, head)
+# 组的连续 query 区间，只写连续块段（写合并友好）。
 @triton.jit(do_not_specialize=["score_block_count"])
 def _prepare_prefill_topk_scores_kernel(
     score_ptr,
@@ -626,6 +676,9 @@ def _prepare_prefill_topk_scores_kernel(
 
 
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
+# ---- prefill top-k 索引掩码核 ----
+# 对预处理后的候选做因果掩码（query 只能看到之前的 block）+
+# 初始块/局部块保底 + 越界剔除，产出 prefill 的最终 top-k 块索引。
 @triton.jit(
     do_not_specialize_on_alignment=["prefix_lengths_ptr"],
 )
@@ -704,6 +757,11 @@ def _mask_prefill_topk_indices_kernel(
         "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"] * triton.next_power_of_2(args["gqa_group_size"]),
     }
 )
+# ---- prefill 块稀疏 GQA 注意力核 ----
+# 网格映射：program 对应 (query 块, Q 头, 请求)。
+# 算法：对每个 query 块，只遍历 top-k 索引指向的 KV block，
+# 块内做标准缩放点积注意力（在线 softmax 分块累加），
+# 跳过因果掩码屏蔽的块（query 只看得到之前的 block）。
 @triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
 def _gqa_sparse_fwd_kernel(
     q_ptr,  # [total_q, num_heads, head_dim]
@@ -873,6 +931,9 @@ def _gqa_sparse_fwd_kernel(
         "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
     }
 )
+# ---- decode 块稀疏 GQA 注意力核 ----
+# 算法：对每个 decode query，只 gather top-k 块的 K/V 做精确注意力；
+# decode_query_len > 1 时支持投机解码的多 query 验证（块内因果）。
 @triton.jit(
     do_not_specialize=[
         "decode_query_len",
@@ -1070,6 +1131,9 @@ def _gqa_sparse_decode_kernel(
 
 
 @triton.heuristics({"BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"])})
+# ---- top-k 分块输出合并核 ----
+# 当 top-k 块数超过单 program 可处理上限时，注意力按块分块计算，
+# 各部分输出（已含部分 softmax 归一因子）在此核中做最终加权合并。
 @triton.jit
 def _merge_topk_attn_out_kernel(
     o_ptr,  # partials: [NUM_TOPK_CHUNKS, total_q, num_heads, head_dim]
@@ -1122,6 +1186,7 @@ def _merge_topk_attn_out_kernel(
 # ---------------------------------------------------------------------------
 # Public Python API
 # ---------------------------------------------------------------------------
+# 把 raw top-k 索引拷贝成 int32 结果并补齐缺失槽位（不足 topk 时填充）。
 def _copy_topk_indices(
     raw_indices: torch.Tensor,
     requested_topk: int,
@@ -1147,6 +1212,7 @@ def _copy_topk_indices(
     return result
 
 
+# 把 raw top-k 分数拷贝成 FP32 结果并补齐缺失槽位。
 def _copy_topk_values(
     raw_values: torch.Tensor,
     requested_topk: int,
@@ -1167,6 +1233,9 @@ def _copy_topk_values(
 
 
 @torch.no_grad()
+# 【公共入口】prefill 索引打分：对全部请求的全部历史 block 计算分数。
+# idx_q [total_q, idx_heads, dim] + index cache → score 缓冲
+#（布局为"每请求连续 block 段"，对齐 16）。变长批处理（cu_seqlens_q）。
 def minimax_m3_index_score(
     idx_q: torch.Tensor,
     index_kv_cache: torch.Tensor,
@@ -1234,6 +1303,8 @@ def minimax_m3_index_score(
 
 
 @torch.no_grad()
+# 【公共入口】prefill top-k 选块：预处理分数 → 掩码修正 →
+# 输出 [num_idx_heads, total_q, topk] 的块索引（初始块/局部块保底）。
 def minimax_m3_index_topk(
     score: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
@@ -1314,6 +1385,9 @@ def minimax_m3_index_topk(
 
 
 @torch.no_grad()
+# 【公共入口】decode 索引打分 + top-k（打分与选块一体）。
+# 支持 block_offset/block_count（TP 分片）与 return_scores
+#（TP 归并时返回局部分数）。decode_query_len>1 为投机验证。
 def minimax_m3_index_decode(
     idx_q: torch.Tensor,
     index_kv_cache: torch.Tensor,
@@ -1440,6 +1514,8 @@ def minimax_m3_index_decode(
 
 
 @torch.no_grad()
+# 【公共入口】prefill 块稀疏注意力：q + 分体 KV cache + top-k 索引
+# → 输出。topk 块数超上限时内部走"分块计算 + 合并"两步。
 def minimax_m3_sparse_attn(
     q: torch.Tensor,  # [total_q, num_heads, head_dim]
     kv_cache: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
@@ -1503,6 +1579,7 @@ def minimax_m3_sparse_attn(
 
 
 @torch.no_grad()
+# 【公共入口】decode 块稀疏注意力：只 gather top-k 块的 KV 精确计算。
 def minimax_m3_sparse_attn_decode(
     q: torch.Tensor,  # [total_q, num_heads, head_dim]
     kv_cache: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
